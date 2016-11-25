@@ -32,6 +32,7 @@ strategy:
 - cull uninteresting files based on size
 - cull large files with interior pieces or with padding by probing a piece contained in the file
 - TODO: cull small without internal pieces if they have sha1 in the metadata
+- TODO: better iteration order for the scan window
 - try all combinations at piece boundaries
 - (optional) full scan of the remaining large files since we only probed 1 piece in the first step
 
@@ -362,6 +363,18 @@ impl MappedTorrent {
 			//let cnt = window.iter().map(|cset| format!("{}", cset.len())).join(",");
 			//println_err!("comb {}", cnt);
 
+			let cnt = window.iter().map(|cset| cset.len()).fold(1, |acc, v| if acc < 10000  {acc * v} else {acc});
+
+			//println!("comb {}", cnt);
+
+			if cnt >= 5000 {
+				println_err!("warning: combinatorial explosion at piece {}; potentially unbounded processing time", piece_idx);
+				/*
+				for (i, cset) in window.iter().enumerate() {
+					println!("{} -> {}",torrent.files[first_file + i].path.display(), cset.iter().map(|cf| cf.path.to_string_lossy()).join(", "))
+				}*/
+			}
+
 
 			let mut counters = vec![0 ; window.len()];
 
@@ -584,28 +597,20 @@ impl FileSearch {
 	fn sort_candidates(&mut self) {
 		for mapped in &mut self.torrents {
 			for i in 0..mapped.torrent.files.len() {
+				let name : &str = mapped.torrent.name.as_str();
 				let ref tf = mapped.torrent.files[i];
 				let ref mut cset = mapped.candidates[i];
 
 				cset.sort_by_key(|cf| {
-					let mut points = 0;
+					let mut points = 0 as i32;
 					if tf.path.extension() == cf.path.extension() {
 						points += 1;
 					}
 
-					let mut p1 : Option<&Path> = Some(&tf.path);
-					let mut p2 : Option<&Path> = Some(&cf.path);
+					let torrent_path = tf.path.components().rev().map(|cmp| cmp.as_os_str().to_string_lossy()).chain(Some(std::borrow::Cow::Borrowed(name)));
+					let file_path = cf.path.components().rev().map(|cmp| cmp.as_os_str().to_string_lossy());
 
-					while let (Some(pp1), Some(pp2)) = (p1,p2) {
-						if pp1.file_name() != pp2.file_name() {
-							break;
-						}
-						points += 1;
-
-						p1 = pp1.parent();
-						p2 = pp2.parent();
-					}
-
+					points += torrent_path.zip(file_path).filter(|&(ref a, ref b)| a.to_lowercase() == b.to_lowercase()).count() as i32;
 
 					-points
 				});
