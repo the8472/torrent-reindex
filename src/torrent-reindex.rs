@@ -5,7 +5,8 @@ extern crate bdecode;
 extern crate walkdir;
 extern crate multimap;
 extern crate crypto;
-extern crate clap;
+#[macro_use] extern crate clap;
+extern crate rayon;
 #[macro_use] extern crate itertools;
 
 use itertools::Itertools;
@@ -23,6 +24,7 @@ use multimap::MultiMap;
 use crypto::digest::Digest;
 use crypto::sha1::Sha1;
 use clap::{Arg, App, SubCommand, ArgGroup};
+use rayon::par_iter::*;
 
 
 /*
@@ -203,6 +205,10 @@ impl TFile {
 		});
 	}
 
+	fn has_interior_pieces(&self, piece_size : u64) -> bool {
+		self.piece_numbers(piece_size, true).next().is_some()
+	}
+
 	fn num_pieces(&self, piece_size : u64) -> usize {
 		let piece_start = self.offset - self.offset % piece_size;
 		let span = self.end() - piece_start;
@@ -236,12 +242,13 @@ enum PieceState {
 #[derive(Debug, Eq, PartialEq, Clone)]
 struct CandidateFile {
 	path: PathBuf,
+    duplicates: Vec<PathBuf>,
 	pieces: Vec<PieceState>
 }
 
 impl CandidateFile {
 	fn build(num_pieces: usize, path: PathBuf) -> CandidateFile {
-		CandidateFile {pieces: vec![PieceState::NotScanned; num_pieces], path: path}
+		CandidateFile {pieces: vec![PieceState::NotScanned; num_pieces], path: path, duplicates: vec![]}
 	}
 
 	fn set_piece_state(&mut self, idx: usize, val: PieceState) {
@@ -467,21 +474,22 @@ impl MappedTorrent {
 					let ref tf = torrent.files[i + first_file];
 
 					let chunk_start = std::cmp::max(tf.offset, piece_space_offset);
+					let chunk_end =  std::cmp::min(tf.end(), pend);
 
-					let read_limit = pend - chunk_start;
+					let read_limit = chunk_end - chunk_start;
 
-					let mut reference = vec![];
+					let mut reference = vec![0 ; read_limit as usize];
+					let mut probe = vec![0 ; read_limit as usize];
 
 					let seek = chunk_start - tf.offset;
 					f.seek(SeekFrom::Start(seek)).unwrap();
-					f.take(read_limit).read_to_end(&mut reference).unwrap();
+					f.read_exact(&mut reference[..]).unwrap();
 
 					for cidx in (0..cset.len()).filter(|j| *j != match_idx) {
 						let ref mut cf = cset[cidx];
 						let mut f2 = File::open(&cf.path).unwrap();
 						f2.seek(SeekFrom::Start(seek)).unwrap();
-						let mut probe = vec![];
-						f2.take(read_limit).read_to_end(&mut probe).unwrap();
+						f2.read_exact(&mut probe[..]).unwrap();
 
 						let old_val = cf.piece_state(idx);
 						let new_state = if probe == reference {PieceState::Match} else {PieceState::Fail};
@@ -587,11 +595,11 @@ impl FileSearch {
 
 	fn cull_large_files(&mut self, fast_scan: bool) {
 		// eliminate non-matching files with internal pieces
-		for mapped in &mut self.torrents {
+		(&mut self.torrents).par_iter_mut().for_each(|mapped| {
 			for i in 0..mapped.torrent.files.len() {
 				mapped.cull_file(i, fast_scan);
 			}
-		}
+		})
 	}
 
 	fn sort_candidates(&mut self) {
@@ -618,6 +626,36 @@ impl FileSearch {
 		}
 	}
 
+    fn fold_small_files(&mut self) {
+        for ref mut mapped in &mut self.torrents {
+            for i in 0..mapped.torrent.files.len() {
+                let ref tf = mapped.torrent.files[i];
+
+                if mapped.candidates[i].len() < 2 || tf.has_interior_pieces(mapped.torrent.piece_size) {
+                    continue;
+                }
+
+                let mut cset = vec![];
+
+                std::mem::swap(&mut cset, &mut mapped.candidates[i]);
+
+                mapped.candidates[i] = cset.into_iter().map(|cf| (hash_file(&cf.path), cf)).group_by(|pair| pair.0).into_iter().map(|group| {
+
+                    let (hash, mut dups) = group;
+
+                    let mut first = dups.next().unwrap().1;
+                    first.duplicates = dups.map(|pair| pair.1.path).collect();
+
+                    first
+                }).collect();
+
+
+
+            }
+        }
+
+    }
+
 	fn iter<'a>(&'a self) -> impl Iterator<Item=(&'a Torrent,&'a TFile,&'a Vec<CandidateFile>)> + 'a {
 		return self.torrents.iter().flat_map(move |mapping| mapping.candidates.iter().enumerate().map(move |(i, paths)| {
 			(&mapping.torrent, &mapping.torrent.files[i], paths)
@@ -626,7 +664,7 @@ impl FileSearch {
 
 	fn cull_spans(&mut self, fast: bool) {
 
-		for mapping in &mut self.torrents {
+		(&mut self.torrents).par_iter_mut().for_each(|mapping| {
 			let ps = mapping.torrent.piece_size;
 
 			for i in 0..mapping.torrent.files.len() {
@@ -638,9 +676,33 @@ impl FileSearch {
 				mapping.scan_pieces(pieces);
 			}
 
-		}
+		})
 	}
 
+}
+
+fn hash_file(p : &Path) -> Option<[u8 ; 20]> {
+
+    if let Ok(mut file) = File::open(p) {
+        let mut hash = Sha1::new();
+        let mut digest = [0 ; 20];
+        let mut read_buffer = [0 ; 16*1024];
+
+        loop {
+            let read = file.read(&mut read_buffer).unwrap();
+            if read == 0 {
+                break;
+            }
+
+            hash.input(&read_buffer[..read]);
+        }
+
+        hash.result(&mut digest);
+
+        return Some(digest)
+    }
+
+    None
 }
 
 
@@ -650,10 +712,17 @@ fn find(torrents: Vec<String>, dirs: Vec<String>, fast: bool) -> Result<FileSear
 
 	let mut search = FileSearch::new();
 
+	//println!("loading torrents");
 	search.add_torrents(torrents.iter().map(|d| Path::new(d)));
+    //println!("indexing directories");
 	search.add_dirs(dirs);
+    //println!("eliminating large files");
 	search.cull_large_files(true);
+    //println!("sorting likely candidates by filename");
 	search.sort_candidates();
+    //println!("folding identical small files");
+    search.fold_small_files();
+    //println!("scanning boundary pieces");
 	search.cull_spans(fast);
 	if !fast {
 		search.cull_large_files(false);
@@ -672,14 +741,22 @@ fn print(search : &FileSearch) {
 			if cands.is_empty() {
 				print!("no matches")
 			} else {
-				print!("found: {}", cands.iter().map(|cf| {
-					let path = cf.path.to_string_lossy();
-					let skipped = cf.pieces.iter().filter(|p| **p == PieceState::NotScanned).count();
-					let hashed = cf.pieces.iter().filter(|p| **p == PieceState::Match).count();
-					let num = tf.num_pieces(mapping.torrent.piece_size);
+                let file_desc = cands.iter().map(|cf| {
+                    let path = cf.path.to_string_lossy();
+                    let skipped = cf.pieces.iter().filter(|p| **p == PieceState::NotScanned).count();
+                    let hashed = cf.pieces.iter().filter(|p| **p == PieceState::Match).count();
+                    let num = tf.num_pieces(mapping.torrent.piece_size);
+                    let dups = cf.duplicates.iter().map(|p| p.to_string_lossy()).join(" ");
 
-					format!("{} ({}/{} skipped:{})",path,hashed,num, skipped)
-				}).join("\t"));
+                    let mut result : String = format!("{} ({}/{} skipped:{})",path,hashed,num, skipped);
+
+                    if dups.len() > 0 {
+                        result.push_str(&format!(" [dups: {}]", dups));
+                    }
+
+                    result
+                }).join("\t");
+				print!("found: {}", file_desc);
 			}
 
 			println!("");
@@ -706,12 +783,16 @@ fn check_presence(torrents: Vec<String>, dirs: Vec<String>) {
 
 }
 
+
 fn main() {
 
 
 	let args = App::new("torrent-reindex")
 		.about("find files matching those described by .torrents")
 		.arg(Arg::with_name("none").short("n").help("print torrents for which no matching files were found"))
+		.arg(Arg::with_name("jobs")
+			.short("j").help("number of parallel reads. 1 likely provides best throughput on spinning rust")
+			.takes_value(true).default_value("1"))
 		.arg(Arg::with_name("single-torrent")
 			.value_name("TORRENT")
 			.help("path containing torrent file(s)")
@@ -729,6 +810,7 @@ fn main() {
 			.help("directories to scan")
 			.short("d")
 			.default_value(".")
+			.takes_value(true)
 			.multiple(true))
 		.arg(Arg::with_name("fast")
 			.long("fast")
@@ -751,6 +833,11 @@ fn main() {
 	let dirs = args.values_of("dirs").unwrap().map(|s| s.to_owned()).collect();
 	let fast = args.is_present("fast");
 	let presence = args.is_present("presence");
+	let threads = value_t!(args.value_of("jobs"), usize).unwrap();
+
+	let thread_conf = rayon::Configuration::new().set_num_threads(threads);
+
+	rayon::initialize(thread_conf).unwrap();
 
 	if presence {
 		check_presence(torrents, dirs);
@@ -768,9 +855,9 @@ mod tests {
 	use super::find;
 	use std::path::{Path, PathBuf};
 
-	#[test]
+    #[test]
     fn it_works() {
-		println!("foo");
+        println!("foo");
 		let vals = vec!["test/mismatches", "test/files"].into_iter().map(|s| s.into()).collect();
 
 		let result = find(vec!["test/test.torrent".to_owned()], vals, false).unwrap();
